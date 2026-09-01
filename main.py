@@ -1,10 +1,10 @@
-﻿from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import yt_dlp
 
 app = FastAPI(title="ingdownloader API")
 
-# Habilitar CORS para permitir conexión desde el frontend
+# Habilitar CORS para permitir solicitudes desde cualquier origen (Firebase, localhost, etc.)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -12,6 +12,11 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+@app.get("/")
+def home():
+    """Endpoint de comprobación"""
+    return {"status": "ok", "message": "ingdownloader API está corriendo"}
 
 @app.get("/api/search")
 def search_youtube(q: str):
