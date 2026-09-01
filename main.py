@@ -12,21 +12,30 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Opciones base de yt-dlp para bypass de detección de bots en Render
+YDL_BASE_OPTS = {
+    'quiet': True,
+    'no_warnings': True,
+    'extractor_args': {
+        'youtube': {
+            'player_client': ['android', 'web']
+        }
+    }
+}
+
 @app.get("/")
 def home():
     return {"status": "ok", "message": "ingdownloader API está corriendo"}
 
 @app.get("/api/search")
 def search_youtube(q: str, type: str = "song"):
-    """Busca videos o listas de reproducción en YouTube"""
     try:
-        # Si la búsqueda es de álbumes/playlists, buscamos playlists en YT
         search_query = f"ytsearch6:{q} playlist" if type == "album" else f"ytsearch6:{q}"
         
         ydl_opts = {
+            **YDL_BASE_OPTS,
             'extract_flat': 'in_playlist',
             'skip_download': True,
-            'quiet': True,
         }
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             res = ydl.extract_info(search_query, download=False)
@@ -51,17 +60,14 @@ def search_youtube(q: str, type: str = "song"):
 
 @app.get("/api/album")
 def get_album_tracks(url: str):
-    """Extrae canciones de una playlist o de un video individual"""
     try:
         ydl_opts = {
+            **YDL_BASE_OPTS,
             'extract_flat': 'in_playlist',
             'skip_download': True,
-            'quiet': True,
         }
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             res = ydl.extract_info(url, download=False)
-            
-            # Si es una playlist con varias canciones
             entries = res.get('entries', [])
             tracks = []
             
@@ -79,7 +85,6 @@ def get_album_tracks(url: str):
                         "url": f"https://www.youtube.com/watch?v={video_id}" if video_id else ""
                     })
             else:
-                # Si es un solo video, lo devolvemos como la única pista del álbum
                 video_id = res.get("id")
                 tracks.append({
                     "id": video_id,
@@ -98,8 +103,8 @@ def get_album_tracks(url: str):
 def get_download_link(url: str, format: str = "mp3"):
     try:
         ydl_opts = {
+            **YDL_BASE_OPTS,
             'format': 'bestaudio/best' if format == 'mp3' else 'bestvideo+bestaudio/best',
-            'quiet': True,
         }
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
@@ -114,3 +119,5 @@ def get_download_link(url: str, format: str = "mp3"):
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
+ 
+  
