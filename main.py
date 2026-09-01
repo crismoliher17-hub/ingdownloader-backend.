@@ -17,28 +17,33 @@ def home():
     return {"status": "ok", "message": "ingdownloader API está corriendo"}
 
 @app.get("/api/search")
-def search_youtube(q: str):
+def search_youtube(q: str, type: str = "song"):
+    """Busca videos o listas de reproducción en YouTube"""
     try:
+        # Si la búsqueda es de álbumes/playlists, buscamos playlists en YT
+        search_query = f"ytsearch6:{q} playlist" if type == "album" else f"ytsearch6:{q}"
+        
         ydl_opts = {
             'extract_flat': 'in_playlist',
             'skip_download': True,
             'quiet': True,
         }
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            res = ydl.extract_info(f"ytsearch6:{q}", download=False)
+            res = ydl.extract_info(search_query, download=False)
             entries = res.get('entries', [])
             
             results = []
             for entry in entries:
                 if not entry:
                     continue
+                video_id = entry.get("id")
                 results.append({
-                    "id": entry.get("id"),
+                    "id": video_id,
                     "title": entry.get("title"),
                     "artist": entry.get("uploader") or "YouTube",
                     "duration": f"{int(entry.get('duration', 0)//60)}:{int(entry.get('duration', 0)%60):02d}" if entry.get('duration') else "3:00",
-                    "thumbnail": f"https://i.ytimg.com/vi/{entry.get('id')}/mqdefault.jpg",
-                    "url": f"https://www.youtube.com/watch?v={entry.get('id')}"
+                    "thumbnail": f"https://i.ytimg.com/vi/{video_id}/mqdefault.jpg" if video_id else "",
+                    "url": f"https://www.youtube.com/watch?v={video_id}" if video_id else entry.get("url", "")
                 })
             return {"results": results}
     except Exception as e:
@@ -46,7 +51,7 @@ def search_youtube(q: str):
 
 @app.get("/api/album")
 def get_album_tracks(url: str):
-    """Extrae las canciones de una lista de reproducción o álbum"""
+    """Extrae canciones de una playlist o de un video individual"""
     try:
         ydl_opts = {
             'extract_flat': 'in_playlist',
@@ -55,21 +60,37 @@ def get_album_tracks(url: str):
         }
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             res = ydl.extract_info(url, download=False)
-            entries = res.get('entries', [])
             
+            # Si es una playlist con varias canciones
+            entries = res.get('entries', [])
             tracks = []
-            for entry in entries:
-                if not entry:
-                    continue
+            
+            if entries:
+                for entry in entries:
+                    if not entry:
+                        continue
+                    video_id = entry.get("id")
+                    tracks.append({
+                        "id": video_id,
+                        "title": entry.get("title"),
+                        "artist": entry.get("uploader") or res.get("title") or "YouTube",
+                        "duration": f"{int(entry.get('duration', 0)//60)}:{int(entry.get('duration', 0)%60):02d}" if entry.get('duration') else "3:00",
+                        "thumbnail": f"https://i.ytimg.com/vi/{video_id}/mqdefault.jpg" if video_id else "",
+                        "url": f"https://www.youtube.com/watch?v={video_id}" if video_id else ""
+                    })
+            else:
+                # Si es un solo video, lo devolvemos como la única pista del álbum
+                video_id = res.get("id")
                 tracks.append({
-                    "id": entry.get("id"),
-                    "title": entry.get("title"),
-                    "artist": entry.get("uploader") or res.get("title") or "YouTube",
-                    "duration": f"{int(entry.get('duration', 0)//60)}:{int(entry.get('duration', 0)%60):02d}" if entry.get('duration') else "3:00",
-                    "thumbnail": f"https://i.ytimg.com/vi/{entry.get('id')}/mqdefault.jpg",
-                    "url": f"https://www.youtube.com/watch?v={entry.get('id')}"
+                    "id": video_id,
+                    "title": res.get("title"),
+                    "artist": res.get("uploader") or "YouTube",
+                    "duration": f"{int(res.get('duration', 0)//60)}:{int(res.get('duration', 0)%60):02d}" if res.get('duration') else "3:00",
+                    "thumbnail": f"https://i.ytimg.com/vi/{video_id}/mqdefault.jpg" if video_id else "",
+                    "url": f"https://www.youtube.com/watch?v={video_id}" if video_id else url
                 })
-            return {"tracks": tracks, "title": res.get("title")}
+                
+            return {"tracks": tracks, "title": res.get("title") or "Álbum"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
