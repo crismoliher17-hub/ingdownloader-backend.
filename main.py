@@ -1,4 +1,3 @@
-```python
 import os
 import re
 from typing import Any
@@ -29,7 +28,7 @@ COBALT_API_URL = os.getenv(
     "https://api.cobalt.tools/",
 ).rstrip("/") + "/"
 
-REQUEST_TIMEOUT = httpx.Timeout(15.0, connect=8.0)
+TIMEOUT = httpx.Timeout(15.0, connect=8.0)
 
 app.add_middleware(
     CORSMiddleware,
@@ -55,12 +54,10 @@ def format_duration(seconds: Any) -> str:
     minutes, seconds = divmod(total, 60)
     hours, minutes = divmod(minutes, 60)
 
-    if hours:
-        return f"{hours}:{minutes:02d}:{seconds:02d}"
-    return f"{minutes}:{seconds:02d}"
+    return f"{hours}:{minutes:02d}:{seconds:02d}" if hours else f"{minutes}:{seconds:02d}"
 
 
-def extract_video_id(value: str) -> str | None:
+def video_id_from_url(value: str) -> str | None:
     value = value.strip()
 
     if re.fullmatch(r"[\w-]{11}", value):
@@ -81,14 +78,14 @@ def extract_video_id(value: str) -> str | None:
     if host.endswith("youtube.com"):
         for marker in ("shorts", "embed", "live"):
             if marker in parts:
-                index = parts.index(marker)
-                if len(parts) > index + 1:
-                    return parts[index + 1]
+                position = parts.index(marker)
+                if len(parts) > position + 1:
+                    return parts[position + 1]
 
     return None
 
 
-def extract_playlist_id(value: str) -> str | None:
+def playlist_id_from_url(value: str) -> str | None:
     parsed = urlparse(value.strip())
     playlist_id = parse_qs(parsed.query).get("list", [None])[0]
 
@@ -99,7 +96,7 @@ def extract_playlist_id(value: str) -> str | None:
     return match.group(1) if match else None
 
 
-def thumbnail_from_video(video: dict[str, Any]) -> str:
+def thumbnail(video: dict[str, Any]) -> str:
     thumbnails = video.get("videoThumbnails") or video.get("thumbnails") or []
 
     if not thumbnails:
@@ -108,9 +105,9 @@ def thumbnail_from_video(video: dict[str, Any]) -> str:
 
     preferred = next(
         (
-            item
-            for item in thumbnails
-            if item.get("quality") in {"high", "maxres", "medium"}
+            image
+            for image in thumbnails
+            if image.get("quality") in {"high", "maxres", "medium"}
         ),
         thumbnails[-1],
     )
@@ -118,7 +115,7 @@ def thumbnail_from_video(video: dict[str, Any]) -> str:
     return preferred.get("url", "")
 
 
-def to_track(video: dict[str, Any]) -> dict[str, Any]:
+def track_from_video(video: dict[str, Any]) -> dict[str, Any]:
     video_id = video.get("videoId") or video.get("id") or ""
 
     return {
@@ -135,71 +132,61 @@ def to_track(video: dict[str, Any]) -> dict[str, Any]:
             or video.get("duration")
             or video.get("durationSeconds")
         ),
-        "thumbnail": thumbnail_from_video(video),
+        "thumbnail": thumbnail(video),
         "source_url": f"https://www.youtube.com/watch?v={video_id}",
     }
 
 
 async def invidious_get(path: str, params: dict[str, Any] | None = None) -> Any:
-    headers = {
-        "Accept": "application/json",
-        "User-Agent": "ING-Downloader/2.0",
-    }
-
-    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT, follow_redirects=True) as client:
+    async with httpx.AsyncClient(timeout=TIMEOUT, follow_redirects=True) as client:
         response = await client.get(
             f"{INVIDIOUS_BASE_URL}{path}",
             params=params,
-            headers=headers,
+            headers={
+                "Accept": "application/json",
+                "User-Agent": "ING-Downloader/2.0",
+            },
         )
         response.raise_for_status()
         return response.json()
 
 
-def choose_stream(
+def select_stream(
     formats: list[dict[str, Any]],
     requested_format: str,
     requested_quality: str,
 ) -> dict[str, Any] | None:
     if requested_format == "mp3":
-        audio_formats = [
+        streams = [
             item
             for item in formats
-            if "audio/" in str(item.get("type", "")).lower()
-            and item.get("url")
+            if "audio/" in str(item.get("type", "")).lower() and item.get("url")
         ]
 
-        if not audio_formats:
+        if not streams:
             return None
 
-        try:
-            target_bitrate = int(requested_quality) * 1000
-        except ValueError:
-            target_bitrate = 320000
+        target = int(requested_quality) * 1000
 
         return min(
-            audio_formats,
-            key=lambda item: abs(int(item.get("bitrate") or 0) - target_bitrate),
+            streams,
+            key=lambda item: abs(int(item.get("bitrate") or 0) - target),
         )
 
-    video_formats = [
+    streams = [
         item
         for item in formats
-        if "video/" in str(item.get("type", "")).lower()
-        and item.get("url")
+        if "video/" in str(item.get("type", "")).lower() and item.get("url")
     ]
 
-    if not video_formats:
+    if not streams:
         return None
 
-    try:
-        target_height = int(str(requested_quality).replace("p", ""))
-    except ValueError:
-        target_height = 720
+    target = int(requested_quality)
 
     return min(
-        video_formats,
-        key=lambda item: abs(int(item.get("height") or 0) - target_height),
+        streams,
+        key=lambda item: abs(int(item.get("height") or 0) - target),
     )
 
 
@@ -207,51 +194,44 @@ def extension_from_stream(stream: dict[str, Any], requested_format: str) -> str:
     if requested_format == "mp4":
         return "mp4"
 
-    mime_type = str(stream.get("type", "")).lower()
+    stream_type = str(stream.get("type", "")).lower()
 
-    if "audio/mpeg" in mime_type:
+    if "audio/mpeg" in stream_type:
         return "mp3"
-    if "audio/mp4" in mime_type:
+    if "audio/mp4" in stream_type:
         return "m4a"
-    if "audio/webm" in mime_type:
+    if "audio/webm" in stream_type:
         return "webm"
-    if "opus" in mime_type:
-        return "opus"
 
-    container = str(stream.get("container", "")).lower()
-    return container if container in {"mp3", "m4a", "webm", "opus"} else "audio"
+    return "audio"
 
 
-async def resolve_with_cobalt(
+async def cobalt_download(
     source_url: str,
     requested_format: str,
     requested_quality: str,
-) -> dict[str, Any] | None:
-    payload: dict[str, Any] = {
+) -> dict[str, str] | None:
+    payload: dict[str, str] = {
         "url": source_url,
         "downloadMode": "audio" if requested_format == "mp3" else "auto",
-        "youtubeVideoQuality": requested_quality if requested_format == "mp4" else "720",
     }
 
     if requested_format == "mp3":
         payload["audioFormat"] = "mp3"
         payload["audioBitrate"] = requested_quality
-
-    headers = {
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-        "User-Agent": "ING-Downloader/2.0",
-    }
+    else:
+        payload["youtubeVideoQuality"] = requested_quality
 
     try:
-        async with httpx.AsyncClient(
-            timeout=REQUEST_TIMEOUT,
-            follow_redirects=True,
-        ) as client:
+        async with httpx.AsyncClient(timeout=TIMEOUT, follow_redirects=True) as client:
             response = await client.post(
                 COBALT_API_URL,
                 json=payload,
-                headers=headers,
+                headers={
+                    "Accept": "application/json",
+                    "Content-Type": "application/json",
+                    "User-Agent": "ING-Downloader/2.0",
+                },
             )
             response.raise_for_status()
             data = response.json()
@@ -259,7 +239,7 @@ async def resolve_with_cobalt(
         if data.get("status") in {"redirect", "tunnel"} and data.get("url"):
             return {
                 "media_url": data["url"],
-                "file_extension": "mp3" if requested_format == "mp3" else "mp4",
+                "extension": "mp3" if requested_format == "mp3" else "mp4",
             }
     except (httpx.HTTPError, ValueError):
         return None
@@ -269,18 +249,12 @@ async def resolve_with_cobalt(
 
 @app.get("/")
 async def home() -> dict[str, str]:
-    return {
-        "status": "ok",
-        "message": "ING Downloader API activa",
-    }
+    return {"status": "ok", "message": "ING Downloader API activa"}
 
 
 @app.get("/api/health")
 async def health() -> dict[str, str]:
-    return {
-        "status": "ok",
-        "provider": INVIDIOUS_BASE_URL,
-    }
+    return {"status": "ok", "provider": INVIDIOUS_BASE_URL}
 
 
 @app.get("/api/search")
@@ -298,14 +272,13 @@ async def search(
             },
         )
 
-        results = [
-            to_track(item)
-            for item in data
-            if item.get("type") in {None, "video"} and item.get("videoId")
-        ]
-
-        return {"results": results[:20]}
-
+        return {
+            "results": [
+                track_from_video(item)
+                for item in data
+                if item.get("type") in {None, "video"} and item.get("videoId")
+            ][:20]
+        }
     except httpx.HTTPError as error:
         raise HTTPException(
             status_code=502,
@@ -317,8 +290,8 @@ async def search(
 async def collection(
     url: str = Query(..., min_length=3, max_length=1000),
 ) -> dict[str, Any]:
-    playlist_id = extract_playlist_id(url)
-    video_id = extract_video_id(url)
+    playlist_id = playlist_id_from_url(url)
+    video_id = video_id_from_url(url)
 
     try:
         if playlist_id:
@@ -328,7 +301,11 @@ async def collection(
             return {
                 "title": data.get("title") or "Playlist",
                 "thumbnail": data.get("playlistThumbnail") or "",
-                "tracks": [to_track(video) for video in videos if video.get("videoId")],
+                "tracks": [
+                    track_from_video(video)
+                    for video in videos
+                    if video.get("videoId")
+                ],
             }
 
         if video_id:
@@ -336,8 +313,8 @@ async def collection(
 
             return {
                 "title": video.get("title") or "Resultado",
-                "thumbnail": thumbnail_from_video(video),
-                "tracks": [to_track(video)],
+                "thumbnail": thumbnail(video),
+                "tracks": [track_from_video(video)],
             }
 
         raise HTTPException(
@@ -347,7 +324,6 @@ async def collection(
 
     except HTTPException:
         raise
-
     except httpx.HTTPError as error:
         raise HTTPException(
             status_code=502,
@@ -373,21 +349,21 @@ async def resolve(
 
     artist = video.get("author") or "Artista desconocido"
     title = video.get("title") or "Sin título"
-    filename_base = clean_filename(f"{artist} - {title}")
+    filename = clean_filename(f"{artist} - {title}")
 
-    cobalt_result = await resolve_with_cobalt(source_url, format, quality)
+    converted = await cobalt_download(source_url, format, quality)
 
-    if cobalt_result:
+    if converted:
         return {
-            "media_url": cobalt_result["media_url"],
-            "filename": f"{filename_base}.{cobalt_result['file_extension']}",
+            "media_url": converted["media_url"],
+            "filename": f"{filename}.{converted['extension']}",
             "title": title,
             "artist": artist,
-            "thumbnail": thumbnail_from_video(video),
+            "thumbnail": thumbnail(video),
             "stream_type": "converted",
         }
 
-    stream = choose_stream(
+    stream = select_stream(
         video.get("adaptiveFormats") or video.get("formatStreams") or [],
         format,
         quality,
@@ -399,14 +375,12 @@ async def resolve(
             detail="No hay una transmisión disponible para este contenido.",
         )
 
-    extension = extension_from_stream(stream, format)
-
     return {
         "media_url": stream["url"],
-        "filename": f"{filename_base}.{extension}",
+        "filename": f"{filename}.{extension_from_stream(stream, format)}",
         "title": title,
         "artist": artist,
-        "thumbnail": thumbnail_from_video(video),
+        "thumbnail": thumbnail(video),
         "stream_type": "direct",
     }
 
@@ -419,5 +393,3 @@ if __name__ == "__main__":
         host="0.0.0.0",
         port=int(os.getenv("PORT", "8000")),
     )
-}
-```
