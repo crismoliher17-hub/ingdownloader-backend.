@@ -1,12 +1,13 @@
+
 import os
 import random
+import re
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 import httpx
 
 app = FastAPI(title="ING Downloader Backend")
 
-# 1. Configuración de CORS permitiendo dominios reales y locales
 ORIGINS = [
     "https://ingdownlader.web.app",
     "https://ingdownloader.web.app",
@@ -23,79 +24,69 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 2. Pool de instancias públicas de Invidious (rotación automática si una cae)
 INVIDIOUS_INSTANCES = [
     "https://inv.nadeko.net",
     "https://invidious.nerdvpn.de",
     "https://invidious.drgns.space",
     "https://vid.puffyan.us",
-    "https://invidious.flokinet.to",
-    "https://invidious.projectsegfau.lt"
+    "https://invidious.flokinet.to"
 ]
 
-# Instancias públicas de Cobalt para obtener enlaces directos de reproducción/descarga
 COBALT_INSTANCES = [
     "https://cobalt.api.redlib.onrender.com",
     "https://api.cobalt.tools"
 ]
 
+def clean_filename(text: str) -> str:
+    return re.sub(r'[\/*?:"<>|]', "", text).strip()
+
 async def fetch_from_invidious(endpoint: str):
-    """Intenta consultar múltiples instancias de Invidious en secuencia si una falla."""
     instances = INVIDIOUS_INSTANCES.copy()
-    random.shuffle(instances)  # Balanceo de carga aleatorio
-    
+    random.shuffle(instances)
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
     
     async with httpx.AsyncClient(timeout=8.0, headers=headers) as client:
         for instance in instances:
             try:
-                url = f"{instance}{endpoint}"
-                response = await client.get(url)
-                if response.status_code == 200:
-                    data = response.json()
-                    return data, instance
+                res = await client.get(f"{instance}{endpoint}")
+                if res.status_code == 200:
+                    return res.json(), instance
             except Exception:
                 continue
-                
-    raise HTTPException(
-        status_code=503, 
-        detail="Todos los proveedores de búsqueda están saturados o caídos momentáneamente."
-    )
+    raise HTTPException(status_code=503, detail="Proveedores no disponibles actualmente.")
 
 @app.get("/api/health")
 async def health():
-    return {"status": "ok", "origins": ORIGINS}
+    return {"status": "ok"}
 
 @app.get("/api/search")
 async def search(q: str = Query(..., min_length=1)):
-    encoded_q = httpx.URL(q).raw_path.decode("utf-8") if hasattr(httpx.URL(q), "raw_path") else q
-    endpoint = f"/api/v1/search?q={q}&type=video"
-    data, working_instance = await fetch_from_invidious(endpoint)
-    
-    # Normalización de resultados para el frontend
+    data, working_instance = await fetch_from_invidious(f"/api/v1/search?q={q}&type=video")
     results = []
+    
     for item in data:
         if item.get("type") == "video":
+            video_id = item.get("videoId")
+            thumb = f"https://img.youtube.com/vi/{video_id}/mqdefault.jpg"
+            
+            length_sec = item.get("lengthSeconds", 0)
+            mins, secs = divmod(length_sec, 60)
+            
             results.append({
-                "videoId": item.get("videoId"),
-                "title": item.get("title"),
-                "author": item.get("author"),
-                "lengthSeconds": item.get("lengthSeconds"),
-                "publishedText": item.get("publishedText"),
-                "viewCount": item.get("viewCount"),
-                "thumbnail": item.get("videoThumbnails", [{}])[0].get("url", "")
+                "videoId": video_id,
+                "title": item.get("title", "Desconocido"),
+                "artist": item.get("author", "Artista Desconocido"),
+                "duration": f"{mins}:{secs:02d}",
+                "views": f"{item.get('viewCount', 0):,}",
+                "thumbnail": thumb
             })
+            
     return {"results": results, "provider": working_instance}
 
 @app.get("/api/resolve")
-async def resolve(video_id: str, format: str = "mp3", quality: str = "320"):
+async def resolve(video_id: str, title: str = "cancion", artist: str = "artista", format: str = "mp3"):
     youtube_url = f"https://www.youtube.com/watch?v={video_id}"
-    
-    headers = {
-        "Accept": "application/json",
-        "Content-Type": "application/json"
-    }
-    
+    headers = {"Accept": "application/json", "Content-Type": "application/json"}
     payload = {
         "url": youtube_url,
         "downloadMode": "audio" if format == "mp3" else "video",
@@ -107,15 +98,16 @@ async def resolve(video_id: str, format: str = "mp3", quality: str = "320"):
         for instance in COBALT_INSTANCES:
             try:
                 res = await client.post(instance, json=payload, headers=headers)
-                if res.status_code == 200:
-                    data = res.json()
-                    if "url" in data:
-                        return {"downloadUrl": data["url"]}
+                if res.status_code == 200 and "url" in res.json():
+                    return {
+                        "downloadUrl": res.json()["url"],
+                        "filename": clean_filename(f"{artist} - {title}.{format}")
+                    }
             except Exception:
                 continue
 
-    # Fallback directo si Cobalt no responde
-    return {"downloadUrl": f"https://inv.nadeko.net/latest_version?id={video_id}&ita=140"}
+    safe_name = clean_filename(f"{artist} - {title}.mp3")
+    return {"downloadUrl": f"https://inv.nadeko.net/latest_version?id={video_id}&ita=140", "filename": safe_name}
 
 if __name__ == "__main__":
     import uvicorn
