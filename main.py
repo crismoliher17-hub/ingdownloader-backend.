@@ -1,4 +1,3 @@
-
 import os
 import random
 import re
@@ -8,17 +7,9 @@ import httpx
 
 app = FastAPI(title="ING Downloader Backend")
 
-ORIGINS = [
-    "https://ingdownlader.web.app",
-    "https://ingdownloader.web.app",
-    "http://localhost:5173",
-    "http://127.0.0.1:5173",
-    "*"
-]
-
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=ORIGINS,
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -28,8 +19,7 @@ INVIDIOUS_INSTANCES = [
     "https://inv.nadeko.net",
     "https://invidious.nerdvpn.de",
     "https://invidious.drgns.space",
-    "https://vid.puffyan.us",
-    "https://invidious.flokinet.to"
+    "https://vid.puffyan.us"
 ]
 
 COBALT_INSTANCES = [
@@ -40,74 +30,56 @@ COBALT_INSTANCES = [
 def clean_filename(text: str) -> str:
     return re.sub(r'[\/*?:"<>|]', "", text).strip()
 
-async def fetch_from_invidious(endpoint: str):
+async def fetch_invidious(endpoint: str):
     instances = INVIDIOUS_INSTANCES.copy()
     random.shuffle(instances)
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
-    
-    async with httpx.AsyncClient(timeout=8.0, headers=headers) as client:
+    async with httpx.AsyncClient(timeout=10.0, headers={"User-Agent": "Mozilla/5.0"}) as client:
         for instance in instances:
             try:
                 res = await client.get(f"{instance}{endpoint}")
                 if res.status_code == 200:
-                    return res.json(), instance
+                    return res.json()
             except Exception:
                 continue
-    raise HTTPException(status_code=503, detail="Proveedores no disponibles actualmente.")
-
-@app.get("/api/health")
-async def health():
-    return {"status": "ok"}
+    raise HTTPException(status_code=503, detail="Servidores no disponibles.")
 
 @app.get("/api/search")
 async def search(q: str = Query(..., min_length=1)):
-    data, working_instance = await fetch_from_invidious(f"/api/v1/search?q={q}&type=video")
+    data = await fetch_invidious(f"/api/v1/search?q={q}&type=video")
     results = []
-    
     for item in data:
         if item.get("type") == "video":
-            video_id = item.get("videoId")
-            thumb = f"https://img.youtube.com/vi/{video_id}/mqdefault.jpg"
-            
-            length_sec = item.get("lengthSeconds", 0)
-            mins, secs = divmod(length_sec, 60)
-            
+            v_id = item.get("videoId")
+            mins, secs = divmod(item.get("lengthSeconds", 0), 60)
             results.append({
-                "videoId": video_id,
+                "videoId": v_id,
                 "title": item.get("title", "Desconocido"),
                 "artist": item.get("author", "Artista Desconocido"),
                 "duration": f"{mins}:{secs:02d}",
-                "views": f"{item.get('viewCount', 0):,}",
-                "thumbnail": thumb
+                "thumbnail": f"https://img.youtube.com/vi/{v_id}/hqdefault.jpg"
             })
-            
-    return {"results": results, "provider": working_instance}
+    return {"results": results}
 
 @app.get("/api/resolve")
-async def resolve(video_id: str, title: str = "cancion", artist: str = "artista", format: str = "mp3"):
-    youtube_url = f"https://www.youtube.com/watch?v={video_id}"
+async def resolve(video_id: str, title: str = "cancion", artist: str = "artista"):
+    yt_url = f"https://www.youtube.com/watch?v={video_id}"
+    payload = {"url": yt_url, "downloadMode": "audio", "audioFormat": "mp3", "quality": "320"}
     headers = {"Accept": "application/json", "Content-Type": "application/json"}
-    payload = {
-        "url": youtube_url,
-        "downloadMode": "audio" if format == "mp3" else "video",
-        "audioFormat": "mp3",
-        "quality": "320"
-    }
 
-    async with httpx.AsyncClient(timeout=15.0) as client:
-        for instance in COBALT_INSTANCES:
+    async with httpx.AsyncClient(timeout=12.0) as client:
+        for inst in COBALT_INSTANCES:
             try:
-                res = await client.post(instance, json=payload, headers=headers)
+                res = await client.post(inst, json=payload, headers=headers)
                 if res.status_code == 200 and "url" in res.json():
                     return {
                         "downloadUrl": res.json()["url"],
-                        "filename": clean_filename(f"{artist} - {title}.{format}")
+                        "filename": clean_filename(f"{artist} - {title}.mp3")
                     }
             except Exception:
                 continue
 
-    safe_name = clean_filename(f"{artist} - {title}.mp3")
-    return {"downloadUrl": f"https://inv.nadeko.net/latest_version?id={video_id}&ita=140", "filename": safe_name}
+    fallback_stream = f"https://inv.nadeko.net/latest_version?id={video_id}&ita=140"
+    return {"downloadUrl": fallback_stream, "filename": clean_filename(f"{artist} - {title}.mp3")}
 
 if __name__ == "__main__":
     import uvicorn
