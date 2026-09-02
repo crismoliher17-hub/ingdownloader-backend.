@@ -12,13 +12,15 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Opciones base de yt-dlp para bypass de detección de bots en Render
+# Opciones optimizadas para saltar la detección de bots en servidores cloud (Render)
 YDL_BASE_OPTS = {
     'quiet': True,
     'no_warnings': True,
+    'nocheckcertificate': True,
+    'ignoreerrors': True,
     'extractor_args': {
         'youtube': {
-            'player_client': ['android', 'web']
+            'player_client': ['ios', 'web_creator', 'mweb']
         }
     }
 }
@@ -39,7 +41,7 @@ def search_youtube(q: str, type: str = "song"):
         }
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             res = ydl.extract_info(search_query, download=False)
-            entries = res.get('entries', [])
+            entries = res.get('entries', []) if res else []
             
             results = []
             for entry in entries:
@@ -68,6 +70,9 @@ def get_album_tracks(url: str):
         }
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             res = ydl.extract_info(url, download=False)
+            if not res:
+                raise HTTPException(status_code=404, detail="No se pudo obtener información de la URL")
+                
             entries = res.get('entries', [])
             tracks = []
             
@@ -108,6 +113,9 @@ def get_download_link(url: str, format: str = "mp3"):
         }
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
+            if not info:
+                raise HTTPException(status_code=404, detail="No se encontró la información del video")
+                
             return {
                 "title": info.get("title"),
                 "download_url": info.get("url"),
@@ -119,5 +127,3 @@ def get_download_link(url: str, format: str = "mp3"):
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
- 
-  
