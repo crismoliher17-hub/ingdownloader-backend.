@@ -1,159 +1,417 @@
-from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-import urllib.request
-import urllib.parse
-import json
+import asyncio
+import os
 import re
-import yt_dlp
+from pathlib import PurePath
+from typing import Any
+from urllib.parse import parse_qs, urlparse
 
-app = FastAPI(title="ING Downloader API")
+import httpx
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
+
+app = FastAPI(title="ING Downloader API", version="2.0.0")
+
+FRONTEND_ORIGINS = [
+    origin.strip()
+    for origin in os.getenv(
+        "FRONTEND_ORIGINS",
+        "https://ingdownloader.web.app,http://localhost:5173,http://127.0.0.1:5173",
+    ).split(",")
+    if origin.strip()
+]
+
+INVIDIOUS_BASE_URL = os.getenv(
+    "INVIDIOUS_BASE_URL",
+    "https://inv.nadeko.net",
+).rstrip("/")
+
+COBALT_API_URL = os.getenv(
+    "COBALT_API_URL",
+    "https://api.cobalt.tools/",
+).rstrip("/") + "/"
+
+REQUEST_TIMEOUT = httpx.Timeout(15.0, connect=8.0)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
+    allow_origins=FRONTEND_ORIGINS,
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
 )
 
-YDL_OPTS = {
-    'quiet': True,
-    'no_warnings': True,
-    'extract_flat': 'in_playlist',
-    'skip_download': True,
-    'nocheckcertificate': True,
-    'ignoreerrors': True,
-}
 
-def clean_filename(title: str) -> str:
-    """Limpia caracteres inválidos para nombres de archivo en Windows/Linux"""
-    clean = re.sub(r'[\\/*?:"<>|]', "", title)
-    return clean.strip() or "cancion"
+def clean_filename(value: str, fallback: str = "archivo") -> str:
+    value = re.sub(r'[\\/:*?"<>|]+', "", value or "")
+    value = re.sub(r"\s+", " ", value).strip(" .")
+    return value[:150] or fallback
+
+
+def format_duration(seconds: Any) -> str:
+    try:
+        total = max(0, int(float(seconds)))
+    except (TypeError, ValueError):
+        return "0:00"
+
+    minutes, seconds = divmod(total, 60)
+    hours, minutes = divmod(minutes, 60)
+
+    if hours:
+        return f"{hours}:{minutes:02d}:{seconds:02d}"
+    return f"{minutes}:{seconds:02d}"
+
+
+def extract_video_id(value: str) -> str | None:
+    value = value.strip()
+    if re.fullmatch(r"[\w-]{11}", value):
+        return value
+
+    parsed = urlparse(value)
+    query = parse_qs(parsed.query)
+
+    if query.get("v"):
+        return query["v"][0]
+
+    host = parsed.netloc.lower().replace("www.", "")
+    parts = [part for part in parsed.path.split("/") if part]
+
+    if host == "youtu.be" and parts:
+        return parts[0]
+
+    if host.endswith("youtube.com"):
+        for marker in ("shorts", "embed", "live"):
+            if marker in parts:
+                index = parts.index(marker)
+                if len(parts) > index + 1:
+                    return parts[index + 1]
+
+    return None
+
+
+def extract_playlist_id(value: str) -> str | None:
+    parsed = urlparse(value.strip())
+    playlist_id = parse_qs(parsed.query).get("list", [None])[0]
+
+    if playlist_id:
+        return playlist_id
+
+    match = re.search(r"(?:playlist|list)/([A-Za-z0-9_-]+)", value)
+    return match.group(1) if match else None
+
+
+def thumbnail_from_video(video: dict[str, Any]) -> str:
+    thumbnails = video.get("videoThumbnails") or video.get("thumbnails") or []
+    if not thumbnails:
+        video_id = video.get("videoId") or video.get("id")
+        return f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg" if video_id else ""
+
+    preferred = next(
+        (
+            item
+            for item in thumbnails
+            if item.get("quality") in {"high", "maxres", "medium"}
+        ),
+        thumbnails[-1],
+    )
+    return preferred.get("url", "")
+
+
+def to_track(video: dict[str, Any]) -> dict[str, Any]:
+    video_id = video.get("videoId") or video.get("id") or ""
+    artist = (
+        video.get("author")
+        or video.get("uploader")
+        or video.get("artist")
+        or "Artista desconocido"
+    )
+    title = video.get("title") or "Sin título"
+
+    return {
+        "id": video_id,
+        "title": title,
+        "artist": artist,
+        "duration": format_duration(
+            video.get("lengthSeconds")
+            or video.get("duration")
+            or video.get("durationSeconds")
+        ),
+        "thumbnail": thumbnail_from_video(video),
+        "source_url": f"https://www.youtube.com/watch?v={video_id}",
+    }
+
+
+async def invidious_get(path: str, params: dict[str, Any] | None = None) -> Any:
+    headers = {
+        "Accept": "application/json",
+        "User-Agent": "ING-Downloader/2.0",
+    }
+
+    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT, follow_redirects=True) as client:
+        response = await client.get(
+            f"{INVIDIOUS_BASE_URL}{path}",
+            params=params,
+            headers=headers,
+        )
+        response.raise_for_status()
+        return response.json()
+
+
+def choose_stream(
+    formats: list[dict[str, Any]],
+    requested_format: str,
+    requested_quality: str,
+) -> dict[str, Any] | None:
+    if requested_format == "mp3":
+        audio_formats = [
+            item
+            for item in formats
+            if "audio/" in str(item.get("type", "")).lower()
+            and item.get("url")
+        ]
+
+        if not audio_formats:
+            return None
+
+        try:
+            target_bitrate = int(requested_quality) * 1000
+        except ValueError:
+            target_bitrate = 320000
+
+        return min(
+            audio_formats,
+            key=lambda item: abs(int(item.get("bitrate") or 0) - target_bitrate),
+        )
+
+    video_formats = [
+        item
+        for item in formats
+        if "video/" in str(item.get("type", "")).lower()
+        and item.get("url")
+        and not item.get("audioTrackType") == "descriptive"
+    ]
+
+    if not video_formats:
+        return None
+
+    try:
+        target_height = int(str(requested_quality).replace("p", ""))
+    except ValueError:
+        target_height = 720
+
+    return min(
+        video_formats,
+        key=lambda item: abs(int(item.get("height") or 0) - target_height),
+    )
+
+
+def extension_from_stream(stream: dict[str, Any], requested_format: str) -> str:
+    if requested_format == "mp4":
+        return "mp4"
+
+    mime_type = str(stream.get("type", "")).lower()
+
+    if "audio/mpeg" in mime_type:
+        return "mp3"
+    if "audio/mp4" in mime_type:
+        return "m4a"
+    if "audio/webm" in mime_type:
+        return "webm"
+    if "opus" in mime_type:
+        return "opus"
+
+    container = str(stream.get("container", "")).lower()
+    return container if container in {"mp3", "m4a", "webm", "opus"} else "audio"
+
+
+async def resolve_with_cobalt(
+    source_url: str,
+    requested_format: str,
+    requested_quality: str,
+) -> dict[str, Any] | None:
+    payload: dict[str, Any] = {
+        "url": source_url,
+        "downloadMode": "audio" if requested_format == "mp3" else "auto",
+        "youtubeVideoQuality": requested_quality if requested_format == "mp4" else "720",
+    }
+
+    if requested_format == "mp3":
+        payload["audioFormat"] = "mp3"
+        payload["audioBitrate"] = requested_quality
+
+    headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "User-Agent": "ING-Downloader/2.0",
+    }
+
+    try:
+        async with httpx.AsyncClient(
+            timeout=REQUEST_TIMEOUT,
+            follow_redirects=True,
+        ) as client:
+            response = await client.post(
+                COBALT_API_URL,
+                json=payload,
+                headers=headers,
+            )
+            response.raise_for_status()
+            data = response.json()
+
+        if data.get("status") in {"redirect", "tunnel"} and data.get("url"):
+            return {
+                "media_url": data["url"],
+                "file_extension": "mp3" if requested_format == "mp3" else "mp4",
+            }
+    except (httpx.HTTPError, ValueError):
+        return None
+
+    return None
+
 
 @app.get("/")
-def home():
-    return {"status": "ok", "message": "ING Downloader API Activa"}
+async def home() -> dict[str, str]:
+    return {
+        "status": "ok",
+        "message": "ING Downloader API activa",
+    }
+
+
+@app.get("/api/health")
+async def health() -> dict[str, str]:
+    return {
+        "status": "ok",
+        "provider": INVIDIOUS_BASE_URL,
+    }
+
 
 @app.get("/api/search")
-def search_youtube(q: str, type: str = "song"):
+async def search(
+    q: str = Query(..., min_length=2, max_length=150),
+) -> dict[str, list[dict[str, Any]]]:
     try:
-        query = f"ytsearch10:{q} playlist" if type == "album" else f"ytsearch10:{q}"
-        with yt_dlp.YoutubeDL(YDL_OPTS) as ydl:
-            res = ydl.extract_info(query, download=False)
-            entries = res.get('entries', []) if res else []
-            
-            results = []
-            for entry in entries:
-                if not entry:
-                    continue
-                v_id = entry.get("id")
-                results.append({
-                    "id": v_id,
-                    "title": entry.get("title", "Sin título"),
-                    "artist": entry.get("uploader") or "Artista Desconocido",
-                    "duration": f"{int(entry.get('duration', 0)//60)}:{int(entry.get('duration', 0)%60):02d}" if entry.get('duration') else "3:30",
-                    "thumbnail": f"https://i.ytimg.com/vi/{v_id}/hqdefault.jpg" if v_id else "",
-                    "url": f"https://www.youtube.com/watch?v={v_id}" if v_id else ""
-                })
-            return {"results": results}
-    except Exception:
-        return {"results": []}
-
-@app.get("/api/album")
-def get_album_tracks(url: str):
-    try:
-        target = url if url.startswith("http") else f"ytsearch1:{url} album"
-        with yt_dlp.YoutubeDL(YDL_OPTS) as ydl:
-            res = ydl.extract_info(target, download=False)
-            if not res:
-                return {"tracks": [], "title": "Álbum no encontrado"}
-
-            if 'entries' in res and res['entries'] and target.startswith("ytsearch"):
-                first_item = res['entries'][0]
-                if first_item:
-                    p_id = first_item.get('id')
-                    res = ydl.extract_info(f"https://www.youtube.com/playlist?list={p_id}", download=False) or res
-
-            entries = res.get('entries', [])
-            tracks = []
-            
-            if entries:
-                for entry in entries:
-                    if not entry:
-                        continue
-                    v_id = entry.get("id")
-                    tracks.append({
-                        "id": v_id,
-                        "title": entry.get("title", "Pista"),
-                        "artist": entry.get("uploader") or res.get("title") or "YouTube",
-                        "duration": f"{int(entry.get('duration', 0)//60)}:{int(entry.get('duration', 0)%60):02d}" if entry.get('duration') else "3:00",
-                        "thumbnail": f"https://i.ytimg.com/vi/{v_id}/hqdefault.jpg" if v_id else "",
-                        "url": f"https://www.youtube.com/watch?v={v_id}" if v_id else ""
-                    })
-            else:
-                v_id = res.get("id")
-                tracks.append({
-                    "id": v_id,
-                    "title": res.get("title", "Canción"),
-                    "artist": res.get("uploader") or "YouTube",
-                    "duration": f"{int(res.get('duration', 0)//60)}:{int(res.get('duration', 0)%60):02d}" if res.get('duration') else "3:00",
-                    "thumbnail": f"https://i.ytimg.com/vi/{v_id}/hqdefault.jpg" if v_id else "",
-                    "url": f"https://www.youtube.com/watch?v={v_id}" if v_id else url
-                })
-                
-            return {"tracks": tracks, "title": res.get("title") or "Álbum Seleccionado"}
-    except Exception:
-        return {"tracks": [], "title": "Error al cargar álbum"}
-
-@app.get("/api/download")
-def get_download_link(url: str, format: str = "mp3", quality: str = "320"):
-    video_id = url.split("v=")[-1].split("&")[0] if "v=" in url else url.split("/")[-1]
-    
-    # Intento 1: API de Cobalt con calidad y formato
-    try:
-        cobalt_payload = json.dumps({
-            "url": f"https://www.youtube.com/watch?v={video_id}",
-            "downloadMode": "audio" if format == "mp3" else "auto",
-            "audioFormat": "mp3",
-            "audioBitrate": quality if format == "mp3" else "320"
-        }).encode('utf-8')
-        
-        req = urllib.request.Request(
-            "https://api.cobalt.tools/api/json",
-            data=cobalt_payload,
-            headers={'Content-Type': 'application/json', 'Accept': 'application/json', 'User-Agent': 'Mozilla/5.0'},
-            method='POST'
+        data = await invidious_get(
+            "/api/v1/search",
+            {
+                "q": q,
+                "type": "video",
+                "sort_by": "relevance",
+                "page": 1,
+            },
         )
-        with urllib.request.urlopen(req, timeout=6) as resp:
-            data = json.loads(resp.read().decode('utf-8'))
-            if "url" in data:
-                return {
-                    "download_url": data["url"],
-                    "filename": f"{clean_filename(data.get('filename', 'cancion'))}.{format}"
-                }
-    except Exception:
-        pass
 
-    # Intento 2: Fallback Piped API
+        results = [
+            to_track(item)
+            for item in data
+            if item.get("type") in {None, "video"} and item.get("videoId")
+        ]
+
+        return {"results": results[:20]}
+    except httpx.HTTPError as error:
+        raise HTTPException(
+            status_code=502,
+            detail="No fue posible consultar el proveedor de búsqueda.",
+        ) from error
+
+
+@app.get("/api/collection")
+async def collection(
+    url: str = Query(..., min_length=3, max_length=1000),
+) -> dict[str, Any]:
+    playlist_id = extract_playlist_id(url)
+    video_id = extract_video_id(url)
+
     try:
-        req = urllib.request.Request(
-            f"https://pipedapi.kavin.rocks/streams/{video_id}",
-            headers={'User-Agent': 'Mozilla/5.0'}
-        )
-        with urllib.request.urlopen(req, timeout=6) as response:
-            data = json.loads(response.read().decode('utf-8'))
-            streams = data.get("audioStreams", []) if format == "mp3" else data.get("videoStreams", [])
-            if streams:
-                title = clean_filename(data.get("title", "cancion"))
-                return {
-                    "download_url": streams[0].get("url"),
-                    "filename": f"{title}.{format}"
-                }
-    except Exception:
-        pass
+        if playlist_id:
+            data = await invidious_get(f"/api/v1/playlists/{playlist_id}")
+            videos = data.get("videos") or []
 
-    raise HTTPException(status_code=400, detail="No se pudo procesar el archivo")
+            return {
+                "title": data.get("title") or "Playlist",
+                "thumbnail": data.get("playlistThumbnail") or "",
+                "tracks": [to_track(video) for video in videos if video.get("videoId")],
+            }
+
+        if video_id:
+            video = await invidious_get(f"/api/v1/videos/{video_id}")
+            return {
+                "title": video.get("title") or "Resultado",
+                "thumbnail": thumbnail_from_video(video),
+                "tracks": [to_track(video)],
+            }
+
+        raise HTTPException(
+            status_code=400,
+            detail="Ingresa una URL válida de video, álbum o playlist.",
+        )
+    except HTTPException:
+        raise
+    except httpx.HTTPError as error:
+        raise HTTPException(
+            status_code=502,
+            detail="No fue posible cargar el contenido solicitado.",
+        ) from error
+
+
+@app.get("/api/resolve")
+async def resolve(
+    video_id: str = Query(..., min_length=11, max_length=20),
+    format: str = Query("mp3", pattern="^(mp3|mp4)$"),
+    quality: str = Query("320", pattern="^(128|192|320|480|720|1080)$"),
+) -> dict[str, Any]:
+    source_url = f"https://www.youtube.com/watch?v={video_id}"
+
+    try:
+        video = await invidious_get(f"/api/v1/videos/{video_id}")
+    except httpx.HTTPError as error:
+        raise HTTPException(
+            status_code=502,
+            detail="No fue posible obtener los datos del medio.",
+        ) from error
+
+    artist = video.get("author") or "Artista desconocido"
+    title = video.get("title") or "Sin título"
+    filename_base = clean_filename(f"{artist} - {title}")
+
+    cobalt_result = await resolve_with_cobalt(source_url, format, quality)
+    if cobalt_result:
+        return {
+            "media_url": cobalt_result["media_url"],
+            "filename": f"{filename_base}.{cobalt_result['file_extension']}",
+            "title": title,
+            "artist": artist,
+            "thumbnail": thumbnail_from_video(video),
+            "stream_type": "converted",
+        }
+
+    stream = choose_stream(
+        video.get("adaptiveFormats") or video.get("formatStreams") or [],
+        format,
+        quality,
+    )
+
+    if not stream or not stream.get("url"):
+        raise HTTPException(
+            status_code=502,
+            detail="No hay una transmisión disponible para este contenido.",
+        )
+
+    extension = extension_from_stream(stream, format)
+
+    return {
+        "media_url": stream["url"],
+        "filename": f"{filename_base}.{extension}",
+        "title": title,
+        "artist": artist,
+        "thumbnail": thumbnail_from_video(video),
+        "stream_type": "direct",
+    }
+
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+
+    uvicorn.run(
+        "main:app",
+        host="0.0.0.0",
+        port=int(os.getenv("PORT", "8000")),
+    )
