@@ -1,7 +1,6 @@
-import asyncio
+```python
 import os
 import re
-from pathlib import PurePath
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
@@ -63,6 +62,7 @@ def format_duration(seconds: Any) -> str:
 
 def extract_video_id(value: str) -> str | None:
     value = value.strip()
+
     if re.fullmatch(r"[\w-]{11}", value):
         return value
 
@@ -101,6 +101,7 @@ def extract_playlist_id(value: str) -> str | None:
 
 def thumbnail_from_video(video: dict[str, Any]) -> str:
     thumbnails = video.get("videoThumbnails") or video.get("thumbnails") or []
+
     if not thumbnails:
         video_id = video.get("videoId") or video.get("id")
         return f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg" if video_id else ""
@@ -113,23 +114,22 @@ def thumbnail_from_video(video: dict[str, Any]) -> str:
         ),
         thumbnails[-1],
     )
+
     return preferred.get("url", "")
 
 
 def to_track(video: dict[str, Any]) -> dict[str, Any]:
     video_id = video.get("videoId") or video.get("id") or ""
-    artist = (
-        video.get("author")
-        or video.get("uploader")
-        or video.get("artist")
-        or "Artista desconocido"
-    )
-    title = video.get("title") or "Sin título"
 
     return {
         "id": video_id,
-        "title": title,
-        "artist": artist,
+        "title": video.get("title") or "Sin título",
+        "artist": (
+            video.get("author")
+            or video.get("uploader")
+            or video.get("artist")
+            or "Artista desconocido"
+        ),
         "duration": format_duration(
             video.get("lengthSeconds")
             or video.get("duration")
@@ -187,7 +187,6 @@ def choose_stream(
         for item in formats
         if "video/" in str(item.get("type", "")).lower()
         and item.get("url")
-        and not item.get("audioTrackType") == "descriptive"
     ]
 
     if not video_formats:
@@ -306,6 +305,7 @@ async def search(
         ]
 
         return {"results": results[:20]}
+
     except httpx.HTTPError as error:
         raise HTTPException(
             status_code=502,
@@ -333,6 +333,7 @@ async def collection(
 
         if video_id:
             video = await invidious_get(f"/api/v1/videos/{video_id}")
+
             return {
                 "title": video.get("title") or "Resultado",
                 "thumbnail": thumbnail_from_video(video),
@@ -343,8 +344,10 @@ async def collection(
             status_code=400,
             detail="Ingresa una URL válida de video, álbum o playlist.",
         )
+
     except HTTPException:
         raise
+
     except httpx.HTTPError as error:
         raise HTTPException(
             status_code=502,
@@ -373,6 +376,7 @@ async def resolve(
     filename_base = clean_filename(f"{artist} - {title}")
 
     cobalt_result = await resolve_with_cobalt(source_url, format, quality)
+
     if cobalt_result:
         return {
             "media_url": cobalt_result["media_url"],
@@ -415,3 +419,5 @@ if __name__ == "__main__":
         host="0.0.0.0",
         port=int(os.getenv("PORT", "8000")),
     )
+}
+```
